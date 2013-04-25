@@ -1,0 +1,922 @@
+unit DJVoice;
+
+interface
+
+uses
+  SysUtils, Classes, Contnrs, Dialogs, Windows, Forms;
+
+type
+  TKeySet = set of Char;
+
+  TCallRec = packed record
+    PhoneNum, Code: string;
+    Rings: Byte;
+  end;
+  PCallRec = ^TCallRec;
+
+  TCalls = class(TObject)
+  private
+    FList: TList;
+  public
+    constructor Create();
+    destructor Destroy; override;
+    function Add(const PhoneNum, Code: string): Integer;
+    function Read(var CallRec: TCallRec): Boolean;
+    function IndexOf(const PhoneNum: string): Integer;
+  end;
+
+  TChannelState = (csFree, csCallIning, csCallInSuccess, csCheckSendDial, csDialing, csDialSuccess, csHangOff);
+  TChannelType = (ctUser, ctTrunk, ctEmpty);
+
+  TOnReceiveKey = procedure(Sender: TObject; const PhoneNum: string; var Step: Integer) of object; //铵键事件
+  TOnReceiveMessage = procedure(Sender: TObject) of object;
+
+  TOnHandlUpEvent = procedure(Sender: TObject; const PhoneNum: string) of object;
+  TOnFreeEvent = procedure(Sender: TObject; const ChannelID: Integer) of object;
+
+  TChannel = class(TThread)
+  private
+    FIsDialOut, FIsConntectd: Boolean;
+    FChannelState: TChannelState;
+    FChannelType: TChannelType;
+    FPhoneNum: string;
+    FChannelID: Integer;
+    FOuttime: TDateTime;
+    FOnHandlUp: TOnHandlUpEvent;
+    FOnChannelState: TChannelState;
+    FOnReceiveKey: TOnReceiveKey;
+    FStepItems: TStrings;
+    FOnChannelFree: TOnFreeEvent;
+    function ReceiveKey(var Key: Char; const ResKeys: TKeySet): string;
+    function ConvStr(const Value: Integer): Char;
+    procedure PlayVoice(const FileName: string);
+    procedure ProcessDialSuccess();
+    procedure ChannelHangUp();
+    procedure ProcessCheckDialSend();
+    procedure ProcessCallInSuccess();
+    function  CheckSigHangUp(): Boolean;
+    procedure ClearStatus();
+    function SwitchOnCallIn(): Boolean;
+    procedure ProcessStep(const OpCode: string; var Step: Integer);
+  protected
+    procedure Execute; override;
+  public
+    constructor Create();
+    destructor Destroy; override;
+  public
+    procedure CreateChannel(const ChennelID: Integer);
+    function GetChannelType(): TChannelType;
+    function GetChannelStatus(): TChannelState;
+    function GetChannelID(): Integer;
+    procedure ChannelProcessor();
+    function CallPhone(const PhoneNum: string): Boolean;
+    property OnChannelFree: TOnFreeEvent read FOnChannelFree write FOnChannelFree;
+    property OnHandlUp: TOnHandlUpEvent read FOnHandlUp write FOnHandlUp;
+    property OnChannelState: TChannelState read FOnChannelState write FOnChannelState;
+    property OnReceiveKey: TOnReceiveKey read FOnReceiveKey write FOnReceiveKey;
+  end;
+
+  TVoiceCard = class(TComponent)
+  private
+    FCalls: TCalls;               //电话列表
+    FChannels: array of TChannel; //端口列表
+    FChannelNum: Integer;
+    FOnReceiveKey: TOnReceiveKey;
+    FOnReceiveMessage: TOnReceiveMessage;
+    FOnHandlUp: TOnHandlUpEvent;
+    FItems: TStrings;
+    function GetCount: Integer;
+    procedure DoChannelFree(Sender: TObject; const ChannelID: Integer);
+    procedure SetItems(const Value: TStrings);
+    procedure Clear();
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  public
+    function PhoneHangUp(const ChannelID: Integer): Boolean;
+    function GetChannel(const ChannelID: Integer): Integer;
+    procedure CallPhone(const PhoneNum, Code, SN: string);
+    procedure Stop();
+    function Startup(): Boolean;
+    function GetAFreeChannel(): Integer;
+  public
+    property Count: Integer read GetCount;
+  published
+    property Items: TStrings read FItems write SetItems;
+    property OnHandlUp: TOnHandlUpEvent read FOnHandlUp write FOnHandlUp;
+    property OnReceiveKey: TOnReceiveKey read FOnReceiveKey write FOnReceiveKey;
+    property OnReceiveMessage: TOnReceiveMessage read FOnReceiveMessage write FOnReceiveMessage;
+  end;
+
+const
+  S_NORESULT = $10;
+  S_BUSY     = $11;
+  S_NOBODY   = $13;
+  S_CONNECT  = $14;
+  S_NOSIGNAL = $15;
+  S_DIALSIG  = $30;
+
+{
+function  LoadDRV(): LongInt; stdcall; far external 'Tc08a32.dll';
+procedure FreeDRV();  stdcall; far external 'Tc08a32.dll';
+procedure GetSysInfo(TmpIni: pointer); stdcall; far external 'Tc08a32.dll';
+function  CheckValidCh() : WORD; stdcall; far external 'Tc08a32.dll';
+function  CheckChType(wChnlNo : WORD): WORD; stdcall; far external 'Tc08a32.dll';
+function  CheckChTypeNew(wChnlNo:word):integer;stdcall; far external 'Tc08a32.dll';
+function  DRec_OffHookDetect(wChnlNo:word):boolean;stdcall; far external 'Tc08a32.dll';
+function  IsSupportCallerID():boolean; stdcall; far external 'Tc08a32.dll';
+function  EnableCard(wUsedCh : WORD; wFileBufLen:WORD) : LONGINT; stdcall; far  external 'Tc08a32.dll';
+procedure DisableCard(); stdcall; far external 'Tc08a32.dll';
+function  SetPackRate( pack:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+procedure Push_Play(); stdcall; far external 'Tc08a32.dll';
+function  RingDetect(wChnlNo:WORD) : BOOLEAN; stdcall; far external 'Tc08a32.dll';
+function  CheckPolarity( chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function  OffHook(chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function  HangUp(chanelNo:integer) :Integer;  stdcall; far  external 'Tc08a32.dll';
+
+function  Sig_Init(Param:word):integer; stdcall; external 'Newsig.dll';
+function  Sig_CheckBusy(wChNo:word):integer;stdcall; external 'Newsig.dll';
+function  Sig_StartDial(wChNo:word;DialNum:pchar;PreDialNum:pchar;wMode:word):integer;stdcall; external 'Newsig.dll';
+function  Sig_CheckDial(wChNo:word):integer;stdcall; external 'Newsig.dll';
+procedure Sig_ResetCheck(wChNo:word);stdcall; external 'Newsig.dll';
+function  Sig_GetCadenceCount(wChNo:word;nCadenceType:integer):integer;stdcall; external 'Newsig.dll';
+function  Sig_CheckDial_New(wChNo:word; plConnectReason: PInteger):integer;stdcall; external 'Newsig.dll';
+
+procedure InitDtmfBuf(wChnlNo: WORD); stdcall; far external 'Tc08a32.dll';
+function  GetDtmfCode(wChnlNo : WORD) :Shortint; stdcall; far  external 'Tc08a32.dll';
+function  DtmfHit(wChnlNo:WORD ):boolean; stdcall; far  external 'Tc08a32.dll';
+
+function  StartPlayFile (wChnlNo : WORD;FileName: PCHAR; StartPos: LONGINT ) : BOOLEAN; stdcall; far external 'Tc08a32.dll';
+procedure StopPlayFile (wChnlNo : WORD); stdcall; external 'Tc08a32.dll';
+
+function  FeedSigFunc:Integer; stdcall; far  external 'Tc08a32.dll';
+procedure StartTimer(wChnlNo:WORD;ClockType:WORD ); stdcall; far  external 'Tc08a32.dll';
+function  ElapseTime (wChnlNo: WORD ;ClockType:WORD  ):LongInt; stdcall; far  external 'Tc08a32.dll';
+function  StartPlaySignal( chanelNo:integer;sigtype:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function  StartHangUpDetect( chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function  HangUpDetect( chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+procedure FeedRing(wChnlNo:WORD );stdcall; far  external 'Tc08a32.dll';
+function  FeedRealRing( chanelNo:integer) :Integer; stdcall;  far  external 'Tc08a32.dll';
+function  FeedPower( chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function  OffHookDetect( chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function  ReadGenerateSigBuf( lpfilename:Pchar) :Integer; stdcall;  far  external 'Tc08a32.dll';
+
+function SendDtmfBuf( chanelNo:integer;dialNum:Pchar) :Integer;  stdcall; far  external 'Tc08a32.dll';
+function CheckSendEnd( chanelNo:integer) :Integer;  stdcall; far  external 'Tc08a32.dll';
+
+function StartSigCheck( chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function StopSigCheck( chanelNo:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function ReadCheckResult( chanelNo:integer;checkMode:integer) :Integer; stdcall; far  external 'Tc08a32.dll';
+function ReadBusyCount :Integer; stdcall;  far  external 'Tc08a32.dll';
+}
+
+implementation
+
+type
+  TSig_Init = function(Param:word):integer; stdcall;
+  TSig_CheckBusy = function(wChNo:word):integer;stdcall;
+  TSig_StartDial = function(wChNo:word;DialNum:pchar;PreDialNum:pchar;wMode:word):integer;stdcall;
+  TSig_CheckDial = function(wChNo:word):integer;stdcall;
+  TSig_ResetCheck = procedure(wChNo:word);stdcall;
+  TSig_GetCadenceCount = function(wChNo:word;nCadenceType:integer):integer;stdcall;
+  TSig_CheckDial_New = function(wChNo:word; plConnectReason: PInteger):integer;stdcall;
+
+  TLoadDRV = function(): LongInt; stdcall;
+  TFreeDRV = procedure();  stdcall;
+  TGetSysInfo = procedure(TmpIni: pointer); stdcall;
+  TCheckValidCh = function() : WORD; stdcall;
+  TCheckChType = function(wChnlNo : WORD): WORD; stdcall;
+  TCheckChTypeNew = function(wChnlNo:word):integer;stdcall;
+  TDRec_OffHookDetect = function(wChnlNo:word):boolean;stdcall;
+  TIsSupportCallerID = function():boolean; stdcall;
+  TEnableCard = function(wUsedCh : WORD; wFileBufLen:WORD) : LONGINT; stdcall;
+  TDisableCard = procedure(); stdcall;
+  TSetPackRate = function( pack:integer) :Integer; stdcall;
+  TPush_Play = procedure(); stdcall;
+  TRingDetect = function(wChnlNo:WORD) : BOOLEAN; stdcall;
+  TCheckPolarity = function( chanelNo:integer) :Integer; stdcall;
+  TOffHook = function(chanelNo:integer) :Integer; stdcall;
+  THangUp = function(chanelNo:integer) :Integer;  stdcall;
+
+  TInitDtmfBuf = procedure(wChnlNo: WORD); stdcall;
+  TGetDtmfCode = function(wChnlNo : WORD) :Shortint; stdcall;
+  TDtmfHit = function(wChnlNo:WORD ):boolean; stdcall;
+
+  TStartPlayFile = function(wChnlNo : WORD;FileName: PCHAR; StartPos: LONGINT ) : BOOLEAN; stdcall;
+  TStopPlayFile = procedure(wChnlNo : WORD); stdcall;
+
+  TFeedSigFunc = function():Integer; stdcall;
+  TStartTimer = procedure(wChnlNo:WORD;ClockType:WORD ); stdcall;
+  TElapseTime = function(wChnlNo: WORD ;ClockType:WORD  ):LongInt; stdcall;
+  TStartPlaySignal = function(chanelNo:integer;sigtype:integer) :Integer; stdcall;
+  TStartHangUpDetect = function(chanelNo:integer) :Integer; stdcall;
+  THangUpDetect = function(chanelNo:integer) :Integer; stdcall;
+  TFeedRing = procedure(wChnlNo:WORD );stdcall;
+  TFeedRealRing = function(chanelNo:integer) :Integer; stdcall;
+  TFeedPower = function(chanelNo:integer) :Integer; stdcall;
+  TOffHookDetect = function(chanelNo:integer) :Integer; stdcall;
+  TReadGenerateSigBuf = function(lpfilename:Pchar) :Integer; stdcall;
+
+  TSendDtmfBuf = function( chanelNo:integer;dialNum:Pchar) :Integer;  stdcall;
+  TCheckSendEnd = function( chanelNo:integer) :Integer;  stdcall;
+
+  TStartSigCheck = function( chanelNo:integer) :Integer; stdcall;
+  TStopSigCheck = function( chanelNo:integer) :Integer; stdcall;
+  TReadCheckResult = function( chanelNo:integer;checkMode:integer) :Integer; stdcall;
+  TReadBusyCount = function():Integer; stdcall;
+
+var
+  HTc08a32, HNewSig: THandle;
+
+  DJApiLoadCount: Integer = 0;
+
+  Sig_Init: TSig_Init;
+  Sig_CheckBusy: TSig_CheckBusy;
+  Sig_StartDial: TSig_StartDial;
+  Sig_CheckDial: TSig_CheckDial;
+  Sig_ResetCheck: TSig_ResetCheck;
+  Sig_GetCadenceCount: TSig_GetCadenceCount;
+  Sig_CheckDial_New: TSig_CheckDial_New;
+
+  LoadDRV: TLoadDRV;
+  FreeDRV: TFreeDRV;
+  GetSysInfo: TGetSysInfo;
+  CheckValidCh: TCheckValidCh;
+  CheckChType: TCheckChType;
+  CheckChTypeNew: TCheckChTypeNew;
+  DRec_OffHookDetect: TDRec_OffHookDetect;
+  IsSupportCallerID: TIsSupportCallerID;
+  EnableCard: TEnableCard;
+  DisableCard: TDisableCard;
+  SetPackRate: TSetPackRate;
+  Push_Play: TPush_Play;
+  RingDetect: TRingDetect;
+  CheckPolarity: TCheckPolarity;
+  OffHook: TOffHook;
+  HangUp: THangUp;
+
+  InitDtmfBuf: TInitDtmfBuf;
+  GetDtmfCode: TGetDtmfCode;
+  DtmfHit: TDtmfHit;
+
+  StartPlayFile: TStartPlayFile;
+  StopPlayFile: TStopPlayFile;
+
+  FeedSigFunc: TFeedSigFunc;
+  StartTimer: TStartTimer;
+  ElapseTime: TElapseTime;
+  StartPlaySignal: TStartPlaySignal;
+  StartHangUpDetect: TStartHangUpDetect;
+  HangUpDetect: THangUpDetect;
+  FeedRing: TFeedRing;
+  FeedRealRing: TFeedRealRing;
+  FeedPower: TFeedPower;
+  OffHookDetect: TOffHookDetect;
+  ReadGenerateSigBuf: TReadGenerateSigBuf;
+
+  SendDtmfBuf: TSendDtmfBuf;
+  CheckSendEnd: TCheckSendEnd;
+
+  StartSigCheck: TStartSigCheck;
+  StopSigCheck: TStopSigCheck;
+  ReadCheckResult: TReadCheckResult;
+  ReadBusyCount: TReadBusyCount;
+
+function LoadDJApi: Boolean;
+begin
+  Inc(DJApiLoadCount);
+  if DJApiLoadCount > 1 then
+    Exit;
+  HTc08a32 := LoadLibrary('Tc08a32.dll');
+  if HTc08a32<>0 then
+  begin
+    @LoadDRV := GetProcAddress(HTc08a32, 'LoadDRV');
+    @FreeDRV := GetProcAddress(HTc08a32, 'FreeDRV');
+    @GetSysInfo := GetProcAddress(HTc08a32, 'GetSysInfo');
+    @CheckValidCh := GetProcAddress(HTc08a32, 'CheckValidCh');
+    @CheckChType := GetProcAddress(HTc08a32, 'CheckChType');
+    @CheckChTypeNew := GetProcAddress(HTc08a32, 'CheckChTypeNew');
+    @DRec_OffHookDetect := GetProcAddress(HTc08a32, 'DRec_OffHookDetect');
+    @IsSupportCallerID := GetProcAddress(HTc08a32, 'IsSupportCallerID');
+    @EnableCard := GetProcAddress(HTc08a32, 'EnableCard');
+    @DisableCard := GetProcAddress(HTc08a32, 'DisableCard');
+    @SetPackRate := GetProcAddress(HTc08a32, 'SetPackRate');
+    @Push_Play := GetProcAddress(HTc08a32, 'Push_Play');
+    @RingDetect := GetProcAddress(HTc08a32, 'RingDetect');
+    @CheckPolarity := GetProcAddress(HTc08a32, 'CheckPolarity');
+    @OffHook := GetProcAddress(HTc08a32, 'OffHook');
+    @HangUp := GetProcAddress(HTc08a32, 'HangUp');
+
+    @InitDtmfBuf := GetProcAddress(HTc08a32, 'InitDtmfBuf');
+    @GetDtmfCode := GetProcAddress(HTc08a32, 'GetDtmfCode');
+    @DtmfHit := GetProcAddress(HTc08a32, 'DtmfHit');
+
+    @StartPlayFile := GetProcAddress(HTc08a32, 'StartPlayFile');
+    @StopPlayFile := GetProcAddress(HTc08a32, 'StopPlayFile');
+
+    @FeedSigFunc := GetProcAddress(HTc08a32, 'FeedSigFunc');
+    @StartTimer := GetProcAddress(HTc08a32, 'StartTimer');
+    @ElapseTime := GetProcAddress(HTc08a32, 'ElapseTime');
+    @StartPlaySignal := GetProcAddress(HTc08a32, 'StartPlaySignal');
+    @StartHangUpDetect := GetProcAddress(HTc08a32, 'StartHangUpDetect');
+    @HangUpDetect := GetProcAddress(HTc08a32, 'HangUpDetect');
+    @FeedRing := GetProcAddress(HTc08a32, 'FeedRing');
+    @FeedRealRing := GetProcAddress(HTc08a32, 'FeedRealRing');
+    @FeedPower := GetProcAddress(HTc08a32, 'FeedPower');
+    @OffHookDetect := GetProcAddress(HTc08a32, 'OffHookDetect');
+    @ReadGenerateSigBuf := GetProcAddress(HTc08a32, 'ReadGenerateSigBuf');
+
+    @SendDtmfBuf := GetProcAddress(HTc08a32, 'SendDtmfBuf');
+    @CheckSendEnd := GetProcAddress(HTc08a32, 'CheckSendEnd');
+
+    @StartSigCheck := GetProcAddress(HTc08a32, 'StartSigCheck');
+    @StopSigCheck := GetProcAddress(HTc08a32, 'StopSigCheck');
+    @ReadCheckResult := GetProcAddress(HTc08a32, 'ReadCheckResult');
+    @ReadBusyCount := GetProcAddress(HTc08a32, 'ReadBusyCount');
+  end;
+  HNewSig := LoadLibrary('NewSig.dll');
+  if HNewSig<>0 then
+  begin
+    @Sig_Init := GetProcAddress(HNewSig, 'Sig_Init');
+    @Sig_CheckBusy := GetProcAddress(HNewSig, 'Sig_CheckBusy');
+    @Sig_StartDial := GetProcAddress(HNewSig, 'Sig_StartDial');
+    @Sig_CheckDial := GetProcAddress(HNewSig, 'Sig_CheckDial');
+    @Sig_ResetCheck := GetProcAddress(HNewSig, 'Sig_ResetCheck');
+    @Sig_GetCadenceCount := GetProcAddress(HNewSig, 'Sig_GetCadenceCount');
+    @Sig_CheckDial_New := GetProcAddress(HNewSig, 'Sig_CheckDial_New');
+  end;
+end;
+
+procedure UnloadDJApi;
+begin
+  Dec(DJApiLoadCount);
+  if DJApiLoadCount > 0 then
+    Exit;
+  FreeLibrary(HTc08a32);
+  FreeLibrary(HNewSig);
+
+  Sig_Init := nil;
+  Sig_CheckBusy := nil;
+  Sig_StartDial := nil;
+  Sig_CheckDial := nil;
+  Sig_ResetCheck := nil;
+  Sig_GetCadenceCount := nil;
+  Sig_CheckDial_New := nil;
+
+  LoadDRV := nil;
+  FreeDRV := nil;
+  GetSysInfo := nil;
+  CheckValidCh := nil;
+  CheckChType := nil;
+  CheckChTypeNew := nil;
+  DRec_OffHookDetect := nil;
+  IsSupportCallerID := nil;
+  EnableCard := nil;
+  DisableCard := nil;
+  SetPackRate := nil;
+  Push_Play := nil;
+  RingDetect := nil;
+  CheckPolarity := nil;
+  OffHook := nil;
+  HangUp := nil;
+
+  InitDtmfBuf := nil;
+  GetDtmfCode := nil;
+  DtmfHit := nil;
+
+  StartPlayFile := nil;
+  StopPlayFile := nil;
+
+  FeedSigFunc := nil;
+  StartTimer := nil;
+  ElapseTime := nil;
+  StartPlaySignal := nil;
+  StartHangUpDetect := nil;
+  HangUpDetect := nil;
+  FeedRing := nil;
+  FeedRealRing := nil;
+  FeedPower := nil;
+  OffHookDetect := nil;
+  ReadGenerateSigBuf := nil;
+
+  SendDtmfBuf := nil;
+  CheckSendEnd := nil;
+
+  StartSigCheck := nil;
+  StopSigCheck := nil;
+  ReadCheckResult := nil;
+  ReadBusyCount := nil;
+end;
+
+{ TVoiceCard }
+
+procedure TVoiceCard.CallPhone(const PhoneNum, Code, SN: string);
+begin
+  FCalls.Add(PhoneNum, Code);
+end;
+
+constructor TVoiceCard.Create(AOwner: TComponent);
+var
+  FChannelNum, FTempNum, I: Integer;
+begin
+  inherited Create(AOwner);
+  FItems := TStrings.Create;
+  FCalls := TCalls.Create;
+  if not (csDesigning in ComponentState) then
+  begin
+    try
+      LoadDRV();
+      FTempNum := CheckValidCh();
+      EnableCard(FTempNum, 1024*59);
+      SetPackRate(0);
+      Sig_Init(0);
+      FChannelNum := FTempNum;
+      SetLength(FChannels, FChannelNum);
+      for I := 0 to FChannelNum - 1 do
+      begin
+        if ( TChannelType(CheckChType(I))<>ctEmpty ) then
+        begin
+          FChannels[I] := TChannel.Create;
+          FChannels[I].CreateChannel(I);
+          FChannels[I].OnChannelFree := DoChannelFree;
+          FChannels[I].OnHandlUp := Self.OnHandlUp;
+          FChannels[I].OnReceiveKey := Self.OnReceiveKey;
+          FChannels[I].FStepItems := FItems;
+        end;
+      end;
+    except
+      Application.MessageBox('加载板卡驱动错误, 是否以加载语音卡!', PChar(Application.Title), MB_ICONERROR);
+    end;
+  end;
+end;
+
+destructor TVoiceCard.Destroy;
+var
+  I: Integer;
+begin
+  Clear;
+  if (Length(FChannels)>0) and (FChannelNum>0) then
+  begin
+    for I := 0 to FChannelNum - 1 do
+    begin
+      if Assigned(FChannels[I]) then
+      begin
+        FChannels[I].Free();
+        FChannels[I] := nil;
+      end;
+    end;
+  end;
+  if not (csDesigning in ComponentState) then
+  begin
+    DisableCard();
+    FreeDRV();
+  end;
+  FCalls.Free;
+  FItems.Free;
+  inherited Destroy;
+end;
+
+function TVoiceCard.GetAFreeChannel: Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := Low(FChannels) to High(FChannels) do
+  begin
+    if (FChannels[I].GetChannelType() = ctEmpty) then continue;
+    if (FChannels[I].GetChannelStatus() = csFree) then
+    begin
+      Result := FChannels[I].GetChannelID();
+      break;
+    end;
+  end;
+end;
+
+function TVoiceCard.GetChannel(const ChannelID: Integer): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := Low(FChannels) to High(FChannels) do
+  begin
+    if (FChannels[I].GetChannelID = ChannelID) then
+    begin
+      Result := I;
+      break;
+    end;
+  end;
+end;
+
+function TVoiceCard.GetCount: Integer;
+begin
+  Result := FChannelNum;
+end;
+
+procedure TVoiceCard.Stop;
+var
+  I: Integer;
+begin
+  for I := 0 to FChannelNum - 1 do
+    FChannels[I].Suspend();
+end;
+
+function TVoiceCard.PhoneHangUp(const ChannelID: Integer): Boolean;
+var
+  K: Integer;
+begin
+  Result := False;
+  K := GetChannel(ChannelID);
+  if (K<>-1) and (Assigned(FChannels[K])) then
+  begin
+    FChannels[K].ChannelHangUp();
+    Result := True;
+  end;
+end;
+
+function TVoiceCard.Startup: Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to FChannelNum - 1 do
+    FChannels[I].Resume();
+  Result := True;
+end;
+
+procedure TVoiceCard.SetItems(const Value: TStrings);
+begin
+  if Assigned(FItems) then
+    FItems.Assign(Value)
+  else
+    FItems := Value;
+end;
+
+procedure TVoiceCard.DoChannelFree(Sender: TObject; const ChannelID: Integer);  //空闲时查找有没电话
+var
+  I: Integer;
+  LCallRec: TCallRec;
+begin
+  if FCalls.Read(LCallRec) then
+  begin
+    I := Self.GetChannel(ChannelID);
+    if I<>-1 then
+      FChannels[I].CallPhone(LCallRec.PhoneNum);
+  end;
+end;
+
+procedure TVoiceCard.Clear;
+var
+  I: Integer;
+begin
+  for I := 0 to FChannelNum - 1 do
+  begin
+    FChannels[I].Suspend();
+    FChannels[I].Terminate();
+    FChannels[I] := nil;
+  end;
+end;
+{ TChannel }
+
+function TChannel.CallPhone(const PhoneNum: string): Boolean;
+begin
+  FIsDialOut := True;
+  FPhoneNum := PhoneNum;
+  OffHook(FChannelID);
+  InitDTMFBuf(FChannelID);
+  Result := Sig_StartDial(FChannelID, PChar(PhoneNum), '', 0) = 1;
+  FChannelState := csCheckSendDial;
+end;
+
+procedure TChannel.ChannelProcessor;
+var
+  State: Integer;
+begin
+  Push_Play();
+  FeedSigFunc();
+  OffHook(FChannelID);
+  case FChannelState of
+    csFree:
+    begin
+      if Assigned(FOnChannelFree) then
+        FOnChannelFree(Self, FChannelID);
+    end;
+    csCallIning:
+    begin
+      SwitchOnCallIn();
+    end;
+    csCallInSuccess:
+    begin
+      if CheckSigHangup() then
+        Exit;
+      ProcessCallInSuccess();
+    end;
+    csCheckSendDial:
+    begin
+      ProcessCheckDialSend();
+    end;
+    csDialing:
+    begin
+      State := Sig_CheckDial(FChannelID);
+      case State of
+        S_CONNECT:
+        begin
+          FChannelState := csDialSuccess;
+        end;
+        S_BUSY:     //检测到对方占线的忙音
+        begin
+          //
+          FChannelState := csHangOff;
+        end;  
+        S_NOBODY:   //振铃若干次，无人接听电话
+        begin
+          //
+          FChannelState := csHangOff;
+        end;  
+        S_NOSIGNAL: //没有信号音
+        begin
+          FChannelState := csHangOff;
+        end;
+      end;
+    end;
+    csDialSuccess:
+    begin
+      if CheckSigHangUp() then
+        Exit;
+      ProcessDialSuccess();
+    end;
+    csHangOff:
+    begin
+      ChannelHangUp();
+    end;
+  end;
+end;
+
+function TChannel.CheckSigHangUp: boolean; //是否对方已挂机
+begin
+  Result := False;
+  if (Sig_CheckBusy(FChannelID)=1) then
+  begin
+    StopPlayFile(FChannelID);
+    FChannelState := csHangOff;
+    Result := True;
+  end;
+end;
+
+function TChannel.ConvStr(const Value: Integer): Char; //转换编码
+begin
+  case Value of
+    10:   Result := '0';
+    11:   Result := '*';
+    12:   Result := '#';
+    13:   Result := 'A';
+    14:   Result := 'B';
+    15:   Result := 'C';
+    0:    Result := 'D';
+    1..9: Result := PChar(Value)[0];
+  end;
+end;
+
+constructor TChannel.Create();
+begin
+  Self.FreeOnTerminate := True;
+  inherited Create(True);
+end;
+
+destructor TChannel.Destroy;
+begin
+  Suspend();
+  ChannelHangUp();
+  inherited Destroy;
+end;
+
+procedure TChannel.Execute;
+begin
+  while not Terminated do
+  begin
+    Synchronize(ChannelProcessor);
+    Sleep(10);
+  end;
+end;
+
+function TChannel.GetChannelID: Integer;
+begin
+  Result := FChannelID;
+end;
+
+function TChannel.GetChannelStatus: TChannelState;
+begin
+  Result := FChannelState;
+end;
+
+procedure TChannel.ChannelHangUp;
+begin
+  FIsDialOut := False;
+  StopSigCheck(FChannelID);
+  HangUp(FChannelID);
+  Sig_ResetCheck(FChannelID);
+  StartSigCheck(FChannelID);
+  InitDTMFBuf(FChannelID);
+  ClearStatus();
+  if ( Assigned(FOnHandlUp) ) then
+    FOnHandlUp(Self, FPhoneNum);
+end;
+
+procedure TChannel.ProcessDialSuccess; //电话语音过程
+var
+  LStep: Integer;
+begin
+  LStep := FStepItems.Count;
+  while (LStep>0) do
+  begin
+    ProcessStep(FStepItems[LStep-1], LStep);
+    if LStep>FStepItems.Count then
+      LStep := FStepItems.Count
+    else
+      Dec(LStep);
+  end;
+  FChannelState := csHangOff;
+end;
+
+procedure TChannel.PlayVoice(const FileName: string);
+begin
+  InitDtmfBuf(FChannelID);
+  StartPlayFile(FChannelID, PChar(FileName), 0);
+end;
+
+procedure TChannel.ProcessCheckDialSend;
+begin
+  if ( CheckSendEnd(FChannelID)=1 ) then
+  begin
+    StartSigCheck(FChannelID);
+    FChannelState := csDialing;
+  end;
+end;
+
+function TChannel.ReceiveKey(var Key: Char; const ResKeys: TKeySet): string; //返回操作键
+begin
+  if ( DtmfHit(FChannelID) ) then
+  begin
+    StopPlayFile(FChannelID);
+    Key := ConvStr(GetDtmfCode(FChannelID));
+  end;
+end;
+
+procedure TChannel.ClearStatus;
+begin
+  FPhoneNum := '';
+  FChannelState := csFree;
+  FIsConntectd := False;
+end;
+
+function TChannel.GetChannelType: TChannelType;
+begin
+  Result := TChannelType(CheckChType(FChannelID));
+end;
+
+procedure TChannel.ProcessCallInSuccess;
+begin
+  FChannelState := csCheckSendDial;
+end;
+
+procedure TChannel.CreateChannel(const ChennelID: Integer);
+begin
+  FChannelID := ChennelID;
+  FChannelType := TChannelType(CheckChType(FChannelID));
+  ClearStatus();
+end;
+
+procedure TChannel.ProcessStep(const OpCode: string; var Step: Integer);
+var
+  I: Integer;
+  LKey: Char;
+  LName, LValue: string;
+
+  function GetKeySet(const AValue: string): TKeySet;
+  var
+    L: Integer;
+  begin
+    if AValue<>'' then
+    begin
+      //for L := 1 to AValue
+    end;
+  end;
+
+begin
+  I := Pos('=', OpCode);
+  if I<>0 then
+  begin
+    LName := Copy(OpCode, 1, I-1);
+    LValue := Copy(OpCode, Length(LName) + 2, MaxInt);
+    if LName='PLAY' then
+    begin
+      if SysUtils.FileExists(LValue) then
+      begin
+        Self.PlayVoice(LValue);
+        StartTimer(FChannelID, 4);
+      end;
+    end
+    else if LName='KEY' then
+    begin
+      if ( Length(ReceiveKey(LKey, GetKeySet(LValue)))>0 ) then
+      begin
+        if Assigned(FOnReceiveKey) then
+          FOnReceiveKey(Self, FPhoneNum, Step);
+      end;
+    end
+    else if LName='KEYS' then
+    begin
+      //
+    end
+    else if LName='RECORD' then
+    begin
+
+    end
+    else if LName='CONVERSE' then
+    begin
+
+    end
+    else
+    begin
+
+    end;
+  end else Step := 0;
+end;
+
+function TChannel.SwitchOnCallIn: Boolean;
+begin
+  OffHook(FChannelID);
+  InitDTMFBuf(FChannelID);
+  StartSigCheck(FChannelID);
+  FChannelState := csCallInSuccess;
+  Result := True;
+end;
+
+{ TCalls }
+
+function TCalls.Add(const PhoneNum, Code: string): Integer;
+var
+  LCallRec: PCallRec;
+begin
+  Result := FList.Count;
+  if ( IndexOf(PhoneNum)=-1 ) then
+  begin
+    New(LCallRec);
+    LCallRec^.PhoneNum := PhoneNum;
+    LCallRec^.Code := Code;
+    Result := FList.Add(LCallRec);
+  end;
+end;
+
+constructor TCalls.Create;
+begin
+  FList := TList.Create
+end;
+
+destructor TCalls.Destroy;
+var
+  I: Integer;
+begin
+  for I := FList.Count - 1 downto 0 do
+    Dispose(FList[I]);
+  FList.Free;
+  inherited Destroy;
+end;
+
+function TCalls.IndexOf(const PhoneNum: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to FList.Count - 1 do
+  begin
+    if ( PCallRec(FList[I])^.PhoneNum=PhoneNum ) then
+    begin
+      Result := I;
+      break;
+    end;
+  end;
+end;
+
+function TCalls.Read(var CallRec: TCallRec): Boolean;
+var
+  P: Pointer;
+begin
+  Result := False;
+  if ( FList.Count>0 ) then
+  begin
+    P := FList.First;
+    if ( P<>nil ) then
+    begin
+      CallRec.PhoneNum := PCallRec(P)^.PhoneNum;
+      CallRec.Code := PCallRec(P)^.Code;
+      FList.Delete(0);
+      Result := True;
+    end;
+  end;
+end;
+
+initialization
+  LoadDJApi;
+finalization
+  UnloadDJApi;
+
+end.
