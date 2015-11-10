@@ -1,7 +1,10 @@
 unit Voices;
+
 interface
+
 uses
   SysUtils, Classes, Contnrs, Messages, Dialogs, Windows, Forms, Consts, CoTypes;
+  
 type
   TCallRec = packed record
     CallPm: Integer;
